@@ -1,174 +1,161 @@
 import streamlit as st
 import json
-import ast
-import traceback
-from typing import List, Dict, Any
+import math
+import os
+from openai import OpenAI
+from typing import Dict, Any, List
 
 # ==========================================
-# PAGE CONFIGURATION & STYLING
+# PAGE CONFIGURATION
 # ==========================================
 st.set_page_config(
-    page_title="AI-Powered Code Rectifier & Testing Assistant",
-    page_icon="🛠️",
+    page_title="Dynamic AI Code Rectifier & Testing Engine",
+    page_icon="⚡",
     layout="wide"
 )
 
-st.title("🛠️ AI-Powered Code Rectifier and Testing Assistant")
-st.markdown("Automated Bug Detection, Code Rectification, Test Case Generation, and Dynamic Test Execution.")
+st.title("⚡ Dynamic AI Code Rectifier & Testing Engine")
+st.caption("Auto-discovering bugs, edge cases, and running regression tests.")
 st.divider()
 
 # ==========================================
-# SIDEBAR CONFIGURATION
+# SECURE API KEY RETRIEVAL & MODEL DISCOVERY
 # ==========================================
-st.sidebar.header("⚙️ Configuration")
-api_choice = st.sidebar.selectbox("LLM Mode", ["Mock Engine (No API Key Required)", "OpenAI GPT-4o-mini"])
-api_key = ""
-if api_choice == "OpenAI GPT-4o-mini":
-    api_key = st.sidebar.text_input("Enter OpenAI API Key", type="password")
+GROQ_API_KEY = st.secrets.get("GROQ_API_KEY") or os.environ.get("GROQ_API_KEY")
 
-# ==========================================
-# DEFAULT FAULTY CODE (FROM SPECIFICATION)
-# ==========================================
-DEFAULT_CODE = '''def calculate_average(numbers):
-    total = 0
+if not GROQ_API_KEY:
+    st.error("⚠️ Groq API Key not detected! Please ensure `GROQ_API_KEY` is in `.streamlit/secrets.toml`.")
+    st.stop()
+
+# Initialize Groq client
+client = OpenAI(
+    api_key=GROQ_API_KEY,
+    base_url="https://api.groq.com/openai/v1"
+)
+
+# Fetch models from your active account and filter out Audio, TTS, and Guard models
+try:
+    all_models = [m.id for m in client.models.list().data]
     
-    for i in range(len(numbers) + 1):
-        total += numbers[i]
-        
-    return total / len(numbers)
+    # Exclude audio/TTS/safety models that require special agreements or fail on text
+    valid_chat_models = [
+        m for m in all_models 
+        if not any(bad in m.lower() for bad in ["whisper", "guard", "orpheus", "canopy", "tts", "audio", "vision"])
+    ]
+    
+    if not valid_chat_models:
+        valid_chat_models = ["openai/gpt-oss-20b", "llama-3.3-70b-versatile"]
+except Exception as e:
+    st.error(f"Failed to connect to Groq: {str(e)}")
+    st.stop()
 
-numbers = [10, 20, 30, 40]
-print(calculate_average(numbers))
-'''
-
-# Mandatory test cases from specification
-MANDATORY_TESTS = [
-    {"id": "TC01", "name": "Standard List", "input": [10, 20, 30], "expected": 20.0},
-    {"id": "TC02", "name": "Single Element", "input": [5], "expected": 5.0},
-    {"id": "TC03", "name": "Empty List", "input": [], "expected": 0.0},  # or None / handled safely
-    {"id": "TC04", "name": "Negative & Positive", "input": [-10, 10], "expected": 0.0},
-    {"id": "TC05", "name": "Sequential Ints", "input": [1, 2, 3, 4], "expected": 2.5},
-]
+# Display active model selector so you always use a valid model
+col_m1, col_m2 = st.columns([3, 1])
+with col_m1:
+    selected_model = st.selectbox(
+        "Active Groq Model (Auto-detected from your account):",
+        options=valid_chat_models,
+        index=0
+    )
+with col_m2:
+    st.write("")
+    st.write("")
+    st.caption("🟢 Connected to Groq")
 
 # ==========================================
-# CORE AI / ANALYSIS ENGINES
+# CORE AI ANALYSIS ENGINE
 # ==========================================
-def analyze_and_rectify_mock(code: str) -> Dict[str, Any]:
-    """Fallback engine replicating exact LLM output without external API."""
-    return {
-        "bugs": [
-            {
-                "type": "Off-by-one Error",
-                "location": "range(len(numbers) + 1)",
-                "explanation": "Iterating up to len(numbers) + 1 causes an IndexError because valid list indices are 0 to len - 1."
-            },
-            {
-                "type": "Division by Zero",
-                "location": "total / len(numbers)",
-                "explanation": "Passing an empty list [] results in len(numbers) == 0, triggering an unhandled ZeroDivisionError."
-            },
-            {
-                "type": "Lack of Input Validation",
-                "location": "Function parameter",
-                "explanation": "The function does not verify if the input is a valid iterable or if it contains non-numeric data."
-            }
-        ],
-        "rectified_code": '''def calculate_average(numbers):
-    """Calculates the average of a list of numbers with defensive checks."""
-    if not isinstance(numbers, (list, tuple)):
-        raise TypeError("Input must be a list or tuple")
-    if len(numbers) == 0:
-        return 0.0
-    
-    total = 0
-    for num in numbers:
-        total += num
-        
-    return total / len(numbers)
-''',
-        "additional_edge_cases": [
-            {"id": "TC06", "name": "Edge: Floating Points", "input": [1.5, 2.5, 3.5], "expected": 2.5},
-            {"id": "TC07", "name": "Edge: Large Numbers", "input": [1000000, 2000000], "expected": 1500000.0}
-        ]
-    }
-
-def analyze_and_rectify_openai(code: str, key: str) -> Dict[str, Any]:
-    """Calls OpenAI API to identify bugs, rectify code, and generate test cases."""
-    from openai import OpenAI
-    client = OpenAI(api_key=key)
-    
-    prompt = f"""
-    Analyze the following Python code for bugs and security/edge-case issues:
-    ```python
-    {code}
-    ```
-    Return a strictly formatted JSON object with this exact structure:
-    {{
+def analyze_with_groq(code_str: str, model_name: str) -> Dict[str, Any]:
+    system_prompt = """
+    You are an expert QA Engineer and Python Auditor.
+    Analyze the user's arbitrary Python code and return a STRICT JSON object with:
+    {
+      "function_name": "exact_name_of_the_primary_function",
       "bugs": [
-        {{"type": "error title", "location": "code line", "explanation": "detailed explanation"}}
+        {"type": "Error Title", "location": "code line", "explanation": "why this fails"}
       ],
-      "rectified_code": "def calculate_average(numbers): ... (valid clean python function only)",
-      "additional_edge_cases": [
-        {{"id": "TC06", "name": "description", "input": [1.5, 2.5], "expected": 2.0}}
+      "edge_cases": [
+        "Description of boundary condition or edge case 1",
+        "Description of boundary condition or edge case 2"
+      ],
+      "rectified_code": "Full corrected python code string with matching function name.",
+      "test_cases": [
+        {
+          "id": "TC01",
+          "name": "Test description",
+          "args": [arg1, arg2],
+          "expected": expected_return_value
+        }
       ]
-    }}
-    Ensure the rectified code handles empty lists (returning 0.0) and validates inputs.
+    }
+    Rules:
+    - 'args' MUST be a list containing positional arguments to pass with *args.
+    - Provide at least 5 varied test cases (normal, edge cases, boundary values).
+    - Return RAW JSON only, without markdown fences.
     """
-    
+
     response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
+        model=model_name,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Analyze and rectify this code:\n\n{code_str}"}
+        ],
         response_format={"type": "json_object"}
     )
     return json.loads(response.choices[0].message.content)
 
 # ==========================================
-# DYNAMIC TEST EXECUTION ENGINE
+# DYNAMIC TEST RUNNER
 # ==========================================
-def execute_tests(function_code: str, test_cases: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Dynamically compiles the rectified code in a safe scope and runs test cases."""
+def execute_dynamic_suite(code_str: str, func_name: str, test_cases: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    scope = {}
     results = []
-    
-    # Create isolated execution scope
-    local_scope = {}
+
     try:
-        exec(function_code, {}, local_scope)
+        exec(code_str, scope)
     except Exception as e:
         for tc in test_cases:
             results.append({
-                **tc,
+                "id": tc["id"],
+                "name": tc["name"],
+                "args": str(tc.get("args")),
+                "expected": str(tc.get("expected")),
                 "actual": "Compilation Error",
                 "status": "FAIL",
                 "error": str(e)
             })
         return results
 
-    func = local_scope.get("calculate_average")
-    if not func:
+    func = scope.get(func_name)
+    if not func or not callable(func):
         for tc in test_cases:
             results.append({
-                **tc,
+                "id": tc["id"],
+                "name": tc["name"],
+                "args": str(tc.get("args")),
+                "expected": str(tc.get("expected")),
                 "actual": "Function Not Found",
                 "status": "FAIL",
-                "error": "calculate_average function definition missing"
+                "error": f"Function '{func_name}' not defined"
             })
         return results
 
     for tc in test_cases:
+        args = tc.get("args", [])
+        expected = tc.get("expected")
         try:
-            actual_val = func(tc["input"])
-            # Compare floating values with tolerance
-            if isinstance(actual_val, (int, float)) and isinstance(tc["expected"], (int, float)):
-                passed = abs(actual_val - tc["expected"]) < 1e-6
+            actual = func(*args)
+            if isinstance(actual, (int, float)) and isinstance(expected, (int, float)):
+                passed = math.isclose(actual, expected, rel_tol=1e-5, abs_tol=1e-5)
             else:
-                passed = actual_val == tc["expected"]
-                
+                passed = (actual == expected)
+
             results.append({
                 "id": tc["id"],
                 "name": tc["name"],
-                "input": str(tc["input"]),
-                "expected": str(tc["expected"]),
-                "actual": str(actual_val),
+                "args": str(args),
+                "expected": str(expected),
+                "actual": str(actual),
                 "status": "PASS" if passed else "FAIL",
                 "error": None
             })
@@ -176,9 +163,9 @@ def execute_tests(function_code: str, test_cases: List[Dict[str, Any]]) -> List[
             results.append({
                 "id": tc["id"],
                 "name": tc["name"],
-                "input": str(tc["input"]),
-                "expected": str(tc["expected"]),
-                "actual": "Runtime Error",
+                "args": str(args),
+                "expected": str(expected),
+                "actual": f"Raised {type(e).__name__}",
                 "status": "FAIL",
                 "error": str(e)
             })
@@ -186,92 +173,97 @@ def execute_tests(function_code: str, test_cases: List[Dict[str, Any]]) -> List[
     return results
 
 # ==========================================
-# USER INTERFACE - 6 SECTIONS
+# USER INTERFACE
 # ==========================================
-
-# 1. Code Input
 st.subheader("1. Code Input")
+
+default_code = '''def calculate_factorial(n):
+    result = 0
+    for i in range(0, n):
+        result = result * i
+    return result
+
+print(calculate_factorial(5))
+'''
+
 user_code = st.text_area(
-    "Submit Faulty Python Code:",
-    value=DEFAULT_CODE,
-    height=200,
-    help="Enter the Python function to be analyzed and rectified."
+    "Python Code Editor:",
+    value=default_code,
+    height=180
 )
 
-start_analysis = st.button("🚀 Analyze, Rectify & Run Tests", type="primary")
-
-if start_analysis:
-    with st.spinner("Analyzing code, rectifying implementation, and synthesizing test suites..."):
+if st.button("🚀 Analyze, Rectify & Execute Dynamic Tests", type="primary"):
+    with st.spinner(f"Analyzing code using {selected_model}..."):
         try:
-            if api_choice == "OpenAI GPT-4o-mini" and api_key:
-                ai_data = analyze_and_rectify_openai(user_code, api_key)
-            else:
-                ai_data = analyze_and_rectify_mock(user_code)
+            analysis = analyze_with_groq(user_code, selected_model)
         except Exception as e:
             st.error(f"Error during AI analysis: {str(e)}")
             st.stop()
 
+    func_name = analysis.get("function_name", "target_function")
+    rectified_code = analysis.get("rectified_code", "")
+    test_cases = analysis.get("test_cases", [])
+
+    st.success(f"🎯 Target function identified: `{func_name}`")
+
+    # Section 2 & 3: Bugs vs Rectified Code
     col1, col2 = st.columns(2)
 
-    # 2. Bug Analysis
     with col1:
-        st.subheader("2. Bug Analysis")
-        for i, bug in enumerate(ai_data.get("bugs", []), 1):
-            with st.expander(f"⚠️ Bug {i}: {bug['type']}", expanded=True):
-                st.markdown(f"**Identified At:** `{bug['location']}`")
-                st.write(bug['explanation'])
+        st.subheader("2. Bug & Edge Case Analysis")
+        st.markdown("**Identified Bugs:**")
+        for i, bug in enumerate(analysis.get("bugs", []), 1):
+            with st.expander(f"❌ Bug {i}: {bug.get('type')}", expanded=True):
+                st.markdown(f"**Location:** `{bug.get('location')}`")
+                st.write(bug.get("explanation"))
 
-    # 3. Corrected Code
+        st.markdown("**Edge Cases Discovered:**")
+        for ec in analysis.get("edge_cases", []):
+            st.markdown(f"- ⚠️ {ec}")
+
     with col2:
-        st.subheader("3. Corrected Python Code")
-        rectified = ai_data.get("rectified_code", "")
-        st.code(rectified, language="python")
+        st.subheader("3. Rectified Python Code")
+        st.code(rectified_code, language="python")
 
-    # Combine mandatory test cases with AI-generated edge cases
-    all_test_cases = MANDATORY_TESTS + ai_data.get("additional_edge_cases", [])
+    # Section 4: Display Test Cases
+    st.subheader("4. Generated Dynamic Test Suite")
+    st.table([
+        {"ID": tc["id"], "Scenario": tc["name"], "Inputs (Args)": str(tc["args"]), "Expected Return": str(tc["expected"])}
+        for tc in test_cases
+    ])
 
-    # 4. Test Case Generation
-    st.subheader("4. Generated Test Cases (Mandatory + AI Edge Cases)")
-    tc_display = [
-        {"Test ID": tc["id"], "Scenario": tc["name"], "Input": str(tc["input"]), "Expected Output": str(tc["expected"])}
-        for tc in all_test_cases
-    ]
-    st.table(tc_display)
+    # Section 5: Side-by-Side Dynamic Execution
+    st.subheader("5. Dynamic Test Execution Comparison")
+    col_orig, col_fixed = st.columns(2)
 
-    # 5. Dynamic Execution & Results
-    st.subheader("5. Test Execution Results")
-    test_results = execute_tests(rectified, all_test_cases)
-    
-    # Format table for results
-    formatted_results = []
-    passed_count = 0
-    for r in test_results:
-        is_pass = r["status"] == "PASS"
-        if is_pass:
-            passed_count += 1
-        formatted_results.append({
-            "Test ID": r["id"],
-            "Scenario": r["name"],
-            "Input": r["input"],
-            "Expected": r["expected"],
-            "Actual": r["actual"],
-            "Status": "✅ PASS" if is_pass else "❌ FAIL"
-        })
-    st.dataframe(formatted_results, use_container_width=True)
+    with col_orig:
+        st.markdown("#### Faulty Code (Before Fix)")
+        orig_results = execute_dynamic_suite(user_code, func_name, test_cases)
+        st.dataframe(
+            [{"Test ID": r["id"], "Scenario": r["name"], "Actual Output": r["actual"], "Status": "✅ PASS" if r["status"] == "PASS" else "❌ FAIL"} for r in orig_results],
+            use_container_width=True
+        )
 
-    # 6. Final Report
-    st.subheader("6. Final Testing Summary Report")
-    total_tests = len(test_results)
-    failed_count = total_tests - passed_count
-    pass_rate = (passed_count / total_tests) * 100
+    with col_fixed:
+        st.markdown("#### Rectified Code (After Fix)")
+        fixed_results = execute_dynamic_suite(rectified_code, func_name, test_cases)
+        st.dataframe(
+            [{"Test ID": r["id"], "Scenario": r["name"], "Actual Output": r["actual"], "Status": "✅ PASS" if r["status"] == "PASS" else "❌ FAIL"} for r in fixed_results],
+            use_container_width=True
+        )
 
-    col_m1, col_m2, col_m3, col_m4 = st.columns(4)
-    col_m1.metric("Total Tests Executed", total_tests)
-    col_m2.metric("Tests Passed", passed_count)
-    col_m3.metric("Tests Failed", failed_count)
-    col_m4.metric("Pass Rate", f"{pass_rate:.1f}%")
+    # Section 6: QA Report
+    st.subheader("6. Final QA Report")
+    orig_passed = sum(1 for r in orig_results if r["status"] == "PASS")
+    fixed_passed = sum(1 for r in fixed_results if r["status"] == "PASS")
+    total = len(test_cases)
 
-    if failed_count == 0:
-        st.success("🎉 All test cases (functional, boundary, and edge cases) passed successfully against the rectified code!")
-    else:
-        st.warning(f"{failed_count} test case(s) failed. Review edge conditions and assertions.")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Total Test Cases", total)
+    m2.metric("Pre-Fix Passed", f"{orig_passed}/{total}")
+    m3.metric("Post-Fix Passed", f"{fixed_passed}/{total}")
+    m4.metric("Improvement", f"+{((fixed_passed - orig_passed)/total)*100:.0f}%" if total > 0 else "0%")
+
+    if fixed_passed == total:
+        st.balloons()
+        st.success("🎉 All functional, boundary, and edge test cases passed against the rectified code!")
